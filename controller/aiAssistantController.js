@@ -1,9 +1,12 @@
-const { v4: uuidv4 } = require("crypto");
-const asyncHandler = require("../utils/asyncHandler");
+
+const { randomUUID } = require("crypto");
 const mongoose = require("mongoose");
+
+const asyncHandler = require("../utils/asyncHandler");
 const services = require("../services.config");
 const AssistantChat = require("../model/assistantChat");
 const ContentOs = require("../model/contentOs");
+
 const {
   generateConversationalResponse,
   analyzeContentSeo,
@@ -12,12 +15,61 @@ const {
   generateCreatorInsights,
 } = require("../services/aiAssistantService");
 
-/**
- * GET /services/ai-assistant
- * Renders the AI Creator Assistant dashboard view.
- */
+// Configuration
+const MAX_PROMPT_LENGTH = 5000;
+const MAX_TITLE_LENGTH = 100;
+const MAX_HISTORY_LENGTH = 20;
+const DEFAULT_PLATFORM = "general";
+const DEFAULT_TONE = "energetic";
+const DEFAULT_LENGTH = "medium";
+
+// Common helpers
+const getUserId = (req) => req.user?.id || req.user?._id;
+
+const ensureAuthenticated = (req, res) => {
+  if (!getUserId(req)) {
+    res.status(401).json({
+      success: false,
+      message: "Authentication required",
+    });
+    return false;
+  }
+  return true;
+};
+
+const validateObjectId = (id) =>
+  mongoose.Types.ObjectId.isValid(id);
+
+const validateText = (value, field = "Text", maxLength = MAX_PROMPT_LENGTH) => {
+  if (typeof value !== "string" || !value.trim()) {
+    return `${field} is required`;
+  }
+
+  if (value.length > maxLength) {
+    return `${field} cannot exceed ${maxLength} characters`;
+  }
+
+  return null;
+};
+
+const successResponse = (res, data, message = "Success") =>
+  res.status(200).json({
+    success: true,
+    message,
+    data,
+  });
+
+const errorResponse = (res, status, message) =>
+  res.status(status).json({
+    success: false,
+    message,
+  });
+
+// GET /services/ai-assistant
+// Render AI Creator Assistant dashboard
 const renderAssistantView = asyncHandler(async (req, res) => {
-  const userId = req.user?.id || req.user?._id;
+  const userId = getUserId(req);
+
   let chats = [];
 
   if (userId) {
@@ -33,7 +85,7 @@ const renderAssistantView = asyncHandler(async (req, res) => {
   });
 
   res.render("ai-assistant", {
-    title: "🤖 AI Creator Assistant - CreatorOS",
+    title: "AI Creator Assistant - CreatorOS",
     activeNav: "ai-assistant",
     user: req.user || { name: "Creator" },
     services,
@@ -43,193 +95,310 @@ const renderAssistantView = asyncHandler(async (req, res) => {
   });
 });
 
-/**
- * POST /api/ai-assistant/chat
- * Handles multi-turn chat messages with AI & updates AssistantChat session.
- */
+// POST /api/ai-assistant/chat
+// Send conversational message
 const sendMessage = asyncHandler(async (req, res) => {
-  const userId = req.user?.id || req.user?._id;
-  const { prompt, platform, tone, length, chatId } = req.validatedBody || req.body;
+  if (!ensureAuthenticated(req, res)) return;
 
-  let chatDoc = null;
-  if (chatId) {
-    chatDoc = await AssistantChat.findOne({ _id: chatId, userId });
+  const userId = getUserId(req);
+
+  const {
+    prompt,
+    platform,
+    tone,
+    length,
+    chatId,
+  } = req.validatedBody || req.body;
+
+  // Validate prompt
+  const validationError = validateText(prompt, "Prompt");
+
+  if (validationError) {
+    return errorResponse(res, 400, validationError);
   }
 
-  if (!chatDoc) {
-    const titleSnippet = prompt.slice(0, 40) + (prompt.length > 40 ? "..." : "");
+  // Validate existing chat ID
+  if (chatId && !validateObjectId(chatId)) {
+    return errorResponse(res, 400, "Invalid chat ID");
+  }
+
+  let chatDoc;
+
+  if (chatId) {
+    chatDoc = await AssistantChat.findOne({
+      _id: chatId,
+      userId,
+    });
+
+    if (!chatDoc) {
+      return errorResponse(res, 404, "Chat thread not found");
+    }
+  } else {
+    const titleSnippet = prompt.trim().slice(0, 40);
+
     chatDoc = new AssistantChat({
       userId,
-      title: titleSnippet,
-      platform: platform || "general",
-      tone: tone || "energetic",
-      length: length || "medium",
+      title:
+        titleSnippet +
+        (prompt.trim().length > 40 ? "..." : ""),
+      platform: platform || DEFAULT_PLATFORM,
+      tone: tone || DEFAULT_TONE,
+      length: length || DEFAULT_LENGTH,
       messages: [],
     });
   }
 
-  // User message
-  const userMessageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-  chatDoc.messages.push({
-    messageId: userMessageId,
-    role: "user",
-    content: prompt,
-    createdAt: new Date(),
-  });
+  const cleanPrompt = prompt.trim();
 
-  // Generate AI Response
+  // Add user message
+  const userMessage = {
+    messageId: `msg_${randomUUID()}`,
+    role: "user",
+    content: cleanPrompt,
+    createdAt: new Date(),
+  };
+
+  chatDoc.messages.push(userMessage);
+
+  // Keep recent conversation history for AI context
+  const history = chatDoc.messages.slice(-MAX_HISTORY_LENGTH);
+
+  // Generate AI response
   const aiResult = await generateConversationalResponse({
-    prompt,
+    prompt: cleanPrompt,
     platform: chatDoc.platform,
     tone: chatDoc.tone,
-    length: length || chatDoc.length || "medium",
-    history: chatDoc.messages,
+    length: length || chatDoc.length || DEFAULT_LENGTH,
+    history,
   });
 
-  // Assistant message
-  const assistantMessageId = `msg_${Date.now()}_${Math.random().toString(36).substr(2, 4)}`;
-  const assistantMsg = {
-    messageId: assistantMessageId,
+  if (!aiResult || typeof aiResult.content !== "string") {
+    throw new Error("AI service returned an invalid response");
+  }
+
+  // Build assistant message
+  const assistantMessage = {
+    messageId: `msg_${randomUUID()}`,
     role: "assistant",
     content: aiResult.content,
     structuredData: {
-      suggestions: aiResult.suggestions,
-      seoScore: aiResult.seoScore,
-      viralityScore: aiResult.viralityScore,
-      keywords: aiResult.keywords,
-      hashtags: aiResult.hashtags,
-      ctas: aiResult.ctas,
+      suggestions: aiResult.suggestions || [],
+      seoScore: aiResult.seoScore ?? null,
+      viralityScore: aiResult.viralityScore ?? null,
+      keywords: aiResult.keywords || [],
+      hashtags: aiResult.hashtags || [],
+      ctas: aiResult.ctas || [],
     },
     createdAt: new Date(),
   };
 
-  chatDoc.messages.push(assistantMsg);
+  chatDoc.messages.push(assistantMessage);
+
   await chatDoc.save();
 
-  return res.json({
-    success: true,
-    data: {
+  return successResponse(
+    res,
+    {
       chatId: chatDoc._id,
       title: chatDoc.title,
-      message: assistantMsg,
+      message: assistantMessage,
     },
-  });
+    "Message generated successfully"
+  );
 });
 
-/**
- * GET /api/ai-assistant/chats
- * Retrieves all chat threads for the current user.
- */
+// GET /api/ai-assistant/chats
+// Get current user's chat threads
 const getChats = asyncHandler(async (req, res) => {
-  const userId = req.user?.id || req.user?._id;
-  const chats = await AssistantChat.find({ userId })
+  if (!ensureAuthenticated(req, res)) return;
+
+  const chats = await AssistantChat.find({
+    userId: getUserId(req),
+  })
     .select("title platform tone length updatedAt")
     .sort({ updatedAt: -1 })
+    .limit(100)
     .lean();
 
-  return res.json({ success: true, data: chats });
+  return successResponse(res, chats);
 });
 
-/**
- * GET /api/ai-assistant/chats/:id
- * Retrieves a specific chat thread.
- */
+// GET /api/ai-assistant/chats/:id
+// Get individual chat conversation
 const getChatById = asyncHandler(async (req, res) => {
-  if (!mongoose.Types.ObjectId.isValid(req.params.id))
-    return res.status(400).json({ success: false, message: "Invalid chat ID" });
-  const userId = req.user?.id || req.user?._id;
-  const chat = await AssistantChat.findOne({ _id: req.params.id, userId }).lean();
+  if (!ensureAuthenticated(req, res)) return;
+
+  const { id } = req.params;
+
+  if (!validateObjectId(id)) {
+    return errorResponse(res, 400, "Invalid chat ID");
+  }
+
+  const chat = await AssistantChat.findOne({
+    _id: id,
+    userId: getUserId(req),
+  }).lean();
 
   if (!chat) {
-    return res.status(404).json({ success: false, message: "Chat thread not found" });
+    return errorResponse(res, 404, "Chat thread not found");
   }
 
-  return res.json({ success: true, data: chat });
+  return successResponse(res, chat);
 });
 
-/**
- * DELETE /api/ai-assistant/chats/:id
- * Deletes a chat thread.
- */
+// DELETE /api/ai-assistant/chats/:id
+// Delete individual conversation
 const deleteChat = asyncHandler(async (req, res) => {
-  if (!mongoose.Types.ObjectId.isValid(req.params.id))
-    return res.status(400).json({ success: false, message: "Invalid chat ID" });
-  const userId = req.user?.id || req.user?._id;
-  const result = await AssistantChat.deleteOne({ _id: req.params.id, userId });
+  if (!ensureAuthenticated(req, res)) return;
+
+  const { id } = req.params;
+
+  if (!validateObjectId(id)) {
+    return errorResponse(res, 400, "Invalid chat ID");
+  }
+
+  const result = await AssistantChat.deleteOne({
+    _id: id,
+    userId: getUserId(req),
+  });
 
   if (result.deletedCount === 0) {
-    return res.status(404).json({ success: false, message: "Chat thread not found" });
+    return errorResponse(res, 404, "Chat thread not found");
   }
 
-  return res.json({ success: true, message: "Chat thread deleted successfully" });
+  return successResponse(
+    res,
+    null,
+    "Chat thread deleted successfully"
+  );
 });
 
-/**
- * POST /api/ai-assistant/tools/seo
- */
-const runSeoTool = asyncHandler(async (req, res) => {
-  const { text, platform } = req.validatedBody || req.body;
-  const analysis = analyzeContentSeo(text, platform);
-  return res.json({ success: true, data: analysis });
-});
+// Shared handler for content tools
+const executeContentTool = (toolFunction, toolName) =>
+  asyncHandler(async (req, res) => {
+    if (!ensureAuthenticated(req, res)) return;
 
-/**
- * POST /api/ai-assistant/tools/predict
- */
-const runPredictorTool = asyncHandler(async (req, res) => {
-  const { text, platform } = req.validatedBody || req.body;
-  const prediction = predictContentPerformance(text, platform);
-  return res.json({ success: true, data: prediction });
-});
+    const { text, platform } =
+      req.validatedBody || req.body;
 
-/**
- * POST /api/ai-assistant/tools/hashtags
- */
-const runHashtagTool = asyncHandler(async (req, res) => {
-  const { text, platform } = req.validatedBody || req.body;
-  const matrix = generateHashtagMatrix(text, platform);
-  return res.json({ success: true, data: matrix });
-});
+    const validationError = validateText(text, "Content");
 
-/**
- * GET /api/ai-assistant/tools/insights
- */
+    if (validationError) {
+      return errorResponse(res, 400, validationError);
+    }
+
+    const result = toolFunction(
+      text.trim(),
+      platform || DEFAULT_PLATFORM
+    );
+
+    if (!result) {
+      throw new Error(`${toolName} returned no result`);
+    }
+
+    return successResponse(
+      res,
+      result,
+      `${toolName} completed successfully`
+    );
+  });
+
+// POST /api/ai-assistant/tools/seo
+const runSeoTool = executeContentTool(
+  analyzeContentSeo,
+  "SEO analysis"
+);
+
+// POST /api/ai-assistant/tools/predict
+const runPredictorTool = executeContentTool(
+  predictContentPerformance,
+  "Content prediction"
+);
+
+// POST /api/ai-assistant/tools/hashtags
+const runHashtagTool = executeContentTool(
+  generateHashtagMatrix,
+  "Hashtag generation"
+);
+
+// GET /api/ai-assistant/tools/insights
 const runInsightsTool = asyncHandler(async (req, res) => {
-  const insights = generateCreatorInsights({ niche: req.user?.bio || "Digital Creator" });
-  return res.json({ success: true, data: insights });
+  if (!ensureAuthenticated(req, res)) return;
+
+  const insights = generateCreatorInsights({
+    niche: req.user?.bio || "Digital Creator",
+  });
+
+  return successResponse(
+    res,
+    insights,
+    "Creator insights generated successfully"
+  );
 });
 
-/**
- * POST /api/ai-assistant/export-content-os
- * Exports an AI assistant recommendation directly into Content OS.
- */
+// POST /api/ai-assistant/export-content-os
+// Export assistant recommendations into Content OS
 const exportToContentOs = asyncHandler(async (req, res) => {
-  const userId = req.user?.id || req.user?._id;
-  const { title, description, platform, type } = req.body;
+  if (!ensureAuthenticated(req, res)) return;
 
-  if (!title) {
-    return res.status(400).json({ success: false, message: "Title is required to save to Content OS" });
+  const {
+    title,
+    description,
+    platform,
+    type,
+  } = req.validatedBody || req.body;
+
+  const titleError = validateText(
+    title,
+    "Title",
+    MAX_TITLE_LENGTH
+  );
+
+  if (titleError) {
+    return errorResponse(res, 400, titleError);
   }
 
-  const newContentItem = new ContentOs({
-    userId,
-    title: title.slice(0, 100),
+  if (
+    description !== undefined &&
+    (typeof description !== "string" || description.length > 10000)
+  ) {
+    return errorResponse(
+      res,
+      400,
+      "Description must be a string of at most 10000 characters"
+    );
+  }
+
+  const allowedTypes = [
+    "idea",
+    "post",
+    "video",
+    "reel",
+    "article",
+  ];
+
+  if (type && !allowedTypes.includes(type)) {
+    return errorResponse(res, 400, "Invalid content type");
+  }
+
+  const newContentItem = await ContentOs.create({
+    userId: getUserId(req),
+    title: title.trim(),
     description: description || "",
     type: type || "idea",
     status: "idea",
-    platform: platform || "general",
+    platform: platform || DEFAULT_PLATFORM,
     priority: "medium",
   });
 
-  await newContentItem.save();
-
-  return res.json({
+  return res.status(201).json({
     success: true,
     message: "Successfully exported to Content OS!",
     data: newContentItem,
   });
 });
 
+// Export controller functions
 module.exports = {
   renderAssistantView,
   sendMessage,
